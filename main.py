@@ -283,6 +283,7 @@ def webhook():
     try:
         if request.headers.get('content-type') == 'application/json':
             json_string = request.get_data().decode('utf-8')
+            print(f"JSON recibido: {json_string}")
             update = telebot.types.Update.de_json(json_string)
             bot.process_new_updates([update])
             print(f"Update procesado: {update.update_id}")
@@ -320,3 +321,4 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
     print(f"Iniciando servidor en puerto {port}")
     app.run(host='0.0.0.0', port=port, debug=False)
+
