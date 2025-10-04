@@ -1,18 +1,16 @@
 import os
-import time
 import json
-from datetime import datetime, timedelta
+from datetime import datetime
 from threading import Thread
+import time
 import telebot
-from telebot import types
-from flask import Flask
-import atexit
-import signal
-import sys
+from flask import Flask, request
 
 # ==================== CONFIGURACIÓN ====================
 
-BOT_TOKEN = os.environ.get('BOT_TOKEN', 'TU_TOKEN_AQUI')
+BOT_TOKEN = os.environ.get('BOT_TOKEN')
+WEBHOOK_URL = os.environ.get('WEBHOOK_URL')  # Tu URL de Render
+
 DIAS_INACTIVIDAD = 28
 DIAS_AVISO = 3
 
@@ -29,64 +27,38 @@ Llevas **{dias} días sin participar** en nuestro grupo de batería.
 """
 
 DATA_FILE = 'usuarios_actividad.json'
-LOCK_FILE = '/tmp/bot_running.lock'
 
 # ==================== INICIALIZACIÓN ====================
 
-bot = telebot.TeleBot(BOT_TOKEN)
+bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
 app = Flask(__name__)
+
 usuarios_data = {}
-
-# ==================== LOCK DE PROCESO ====================
-
-def crear_lock():
-    """Crea archivo de lock para evitar múltiples instancias"""
-    if os.path.exists(LOCK_FILE):
-        print("⚠️ Ya existe una instancia del bot corriendo")
-        sys.exit(0)
-    
-    with open(LOCK_FILE, 'w') as f:
-        f.write(str(os.getpid()))
-    print("✅ Lock creado")
-
-def eliminar_lock():
-    """Elimina archivo de lock al cerrar"""
-    if os.path.exists(LOCK_FILE):
-        os.remove(LOCK_FILE)
-        print("✅ Lock eliminado")
-
-def cleanup(signum=None, frame=None):
-    """Limpieza al cerrar"""
-    eliminar_lock()
-    sys.exit(0)
 
 # ==================== FUNCIONES AUXILIARES ====================
 
 def cargar_datos():
-    """Carga datos del archivo JSON"""
     global usuarios_data
     try:
         if os.path.exists(DATA_FILE):
             with open(DATA_FILE, 'r') as f:
                 usuarios_data = json.load(f)
-                print(f"✅ Datos cargados: {len(usuarios_data)} grupos")
+                print(f"Datos cargados: {len(usuarios_data)} grupos")
         else:
             usuarios_data = {}
-            print("📝 Archivo de datos creado")
+            print("Archivo de datos creado")
     except Exception as e:
-        print(f"❌ Error cargando datos: {e}")
+        print(f"Error cargando datos: {e}")
         usuarios_data = {}
 
 def guardar_datos():
-    """Guarda datos en archivo JSON"""
     try:
         with open(DATA_FILE, 'w') as f:
             json.dump(usuarios_data, f, indent=2)
     except Exception as e:
-        print(f"❌ Error guardando datos: {e}")
+        print(f"Error guardando datos: {e}")
 
 def actualizar_actividad(chat_id, user_id, username):
-    """Actualiza la última actividad de un usuario"""
     chat_id = str(chat_id)
     user_id = str(user_id)
     
@@ -101,7 +73,6 @@ def actualizar_actividad(chat_id, user_id, username):
     guardar_datos()
 
 def es_admin(chat_id, user_id):
-    """Verifica si un usuario es administrador"""
     try:
         member = bot.get_chat_member(chat_id, user_id)
         return member.status in ['creator', 'administrator']
@@ -109,7 +80,6 @@ def es_admin(chat_id, user_id):
         return False
 
 def formatear_mencion(user_id, username):
-    """Formatea mención del usuario"""
     if username:
         return f"@{username}"
     else:
@@ -119,7 +89,6 @@ def formatear_mencion(user_id, username):
 
 @bot.message_handler(func=lambda message: True, content_types=['text', 'photo', 'video', 'audio', 'document', 'sticker', 'voice'])
 def registrar_actividad(message):
-    """Registra actividad de todos los usuarios"""
     if message.chat.type in ['group', 'supergroup']:
         actualizar_actividad(
             message.chat.id,
@@ -131,7 +100,6 @@ def registrar_actividad(message):
 
 @bot.message_handler(commands=['start', 'help'])
 def cmd_start(message):
-    """Comando de inicio"""
     if message.chat.type == 'private':
         bot.reply_to(message, 
             "👋 ¡Hola! Soy un bot que expulsa usuarios inactivos.\n\n"
@@ -157,7 +125,6 @@ def cmd_start(message):
 
 @bot.message_handler(commands=['config'])
 def cmd_config(message):
-    """Muestra configuración actual"""
     if message.chat.type not in ['group', 'supergroup']:
         bot.reply_to(message, "⚠️ Este comando solo funciona en grupos")
         return
@@ -187,7 +154,6 @@ Comandos útiles:
 
 @bot.message_handler(commands=['stats'])
 def cmd_stats(message):
-    """Muestra estadísticas del grupo"""
     if message.chat.type not in ['group', 'supergroup']:
         bot.reply_to(message, "⚠️ Este comando solo funciona en grupos")
         return
@@ -231,7 +197,6 @@ def cmd_stats(message):
 
 @bot.message_handler(commands=['check'])
 def cmd_check(message):
-    """Revisa manualmente usuarios inactivos"""
     if message.chat.type not in ['group', 'supergroup']:
         bot.reply_to(message, "⚠️ Este comando solo funciona en grupos")
         return
@@ -247,7 +212,6 @@ def cmd_check(message):
 # ==================== REVISIÓN DE INACTIVIDAD ====================
 
 def revisar_inactivos():
-    """Revisa y procesa usuarios inactivos en todos los grupos"""
     ahora = time.time()
     
     for chat_id, usuarios in list(usuarios_data.items()):
@@ -269,9 +233,9 @@ def revisar_inactivos():
                         
                         del usuarios_data[chat_id][user_id]
                         guardar_datos()
-                        print(f"✅ Usuario {user_id} expulsado del chat {chat_id}")
+                        print(f"Usuario {user_id} expulsado del chat {chat_id}")
                 except Exception as e:
-                    print(f"❌ Error expulsando usuario {user_id}: {e}")
+                    print(f"Error expulsando usuario {user_id}: {e}")
             
             elif dias_inactivo >= (DIAS_INACTIVIDAD - DIAS_AVISO) and not data.get('warned', False):
                 try:
@@ -288,61 +252,56 @@ def revisar_inactivos():
                     
                     usuarios_data[chat_id][user_id]['warned'] = True
                     guardar_datos()
-                    print(f"⚠️ Aviso enviado a usuario {user_id} en chat {chat_id}")
+                    print(f"Aviso enviado a usuario {user_id} en chat {chat_id}")
                 except Exception as e:
-                    print(f"❌ Error enviando aviso a {user_id}: {e}")
+                    print(f"Error enviando aviso a {user_id}: {e}")
 
 def tarea_revision_periodica():
-    """Tarea que revisa inactivos cada 6 horas"""
     while True:
         try:
-            print(f"🔍 Iniciando revisión de inactividad - {datetime.now()}")
+            print(f"Iniciando revisión de inactividad - {datetime.now()}")
             revisar_inactivos()
-            print("✅ Revisión completada")
+            print("Revisión completada")
         except Exception as e:
-            print(f"❌ Error en revisión periódica: {e}")
+            print(f"Error en revisión periódica: {e}")
         
         time.sleep(21600)
 
-# ==================== SERVIDOR FLASK ====================
+# ==================== WEBHOOK ====================
 
 @app.route('/')
 def home():
-    return "🤖 Bot de Inactividad Telegram está funcionando!"
+    return "Bot de Inactividad Telegram activo"
 
-def run_flask():
-    app.run(host='0.0.0.0', port=8080)
+@app.route(f'/{BOT_TOKEN}', methods=['POST'])
+def webhook():
+    if request.headers.get('content-type') == 'application/json':
+        json_string = request.get_data().decode('utf-8')
+        update = telebot.types.Update.de_json(json_string)
+        bot.process_new_updates([update])
+        return '', 200
+    else:
+        return '', 403
 
-# ==================== INICIO DEL BOT ====================
+# ==================== INICIO ====================
 
 if __name__ == '__main__':
-    # Registrar limpieza al salir
-    atexit.register(eliminar_lock)
-    signal.signal(signal.SIGTERM, cleanup)
-    signal.signal(signal.SIGINT, cleanup)
-    
-    # Crear lock para evitar múltiples instancias
-    crear_lock()
-    
-    print("🚀 Iniciando bot de inactividad...")
+    print("Iniciando bot con webhooks...")
     
     cargar_datos()
     
-    flask_thread = Thread(target=run_flask)
-    flask_thread.daemon = True
-    flask_thread.start()
-    print("✅ Servidor Flask iniciado")
+    # Configurar webhook
+    bot.remove_webhook()
+    time.sleep(1)
+    bot.set_webhook(url=f"{WEBHOOK_URL}/{BOT_TOKEN}")
+    print(f"Webhook configurado: {WEBHOOK_URL}")
     
+    # Iniciar tarea de revisión en thread
     revision_thread = Thread(target=tarea_revision_periodica)
     revision_thread.daemon = True
     revision_thread.start()
-    print("✅ Tarea de revisión periódica iniciada")
+    print("Tarea de revisión iniciada")
     
-    print("✅ Bot iniciado y escuchando mensajes...")
-    
-    try:
-        bot.infinity_polling(timeout=60, long_polling_timeout=60)
-    except Exception as e:
-        print(f"❌ Error en polling: {e}")
-        eliminar_lock()
-        sys.exit(1)
+    # Iniciar servidor Flask
+    port = int(os.environ.get('PORT', 8080))
+    app.run(host='0.0.0.0', port=port)
