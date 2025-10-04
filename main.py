@@ -6,19 +6,16 @@ from threading import Thread
 import telebot
 from telebot import types
 from flask import Flask
+import atexit
+import signal
+import sys
 
 # ==================== CONFIGURACIÓN ====================
 
-# Token de tu bot (lo pegarás desde BotFather)
 BOT_TOKEN = os.environ.get('BOT_TOKEN', 'TU_TOKEN_AQUI')
-
-# Días de inactividad antes de expulsar
 DIAS_INACTIVIDAD = 28
-
-# Días de aviso previo
 DIAS_AVISO = 3
 
-# Mensaje de aviso personalizado
 MENSAJE_AVISO = """
 👋 Hola {mention},
 
@@ -31,16 +28,37 @@ Llevas **{dias} días sin participar** en nuestro grupo de batería.
 ¡Esperamos leerte pronto!
 """
 
-# Archivo para guardar datos
 DATA_FILE = 'usuarios_actividad.json'
+LOCK_FILE = '/tmp/bot_running.lock'
 
 # ==================== INICIALIZACIÓN ====================
 
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
-
-# Estructura de datos: {chat_id: {user_id: {'username': str, 'last_activity': timestamp, 'warned': bool}}}
 usuarios_data = {}
+
+# ==================== LOCK DE PROCESO ====================
+
+def crear_lock():
+    """Crea archivo de lock para evitar múltiples instancias"""
+    if os.path.exists(LOCK_FILE):
+        print("⚠️ Ya existe una instancia del bot corriendo")
+        sys.exit(0)
+    
+    with open(LOCK_FILE, 'w') as f:
+        f.write(str(os.getpid()))
+    print("✅ Lock creado")
+
+def eliminar_lock():
+    """Elimina archivo de lock al cerrar"""
+    if os.path.exists(LOCK_FILE):
+        os.remove(LOCK_FILE)
+        print("✅ Lock eliminado")
+
+def cleanup(signum=None, frame=None):
+    """Limpieza al cerrar"""
+    eliminar_lock()
+    sys.exit(0)
 
 # ==================== FUNCIONES AUXILIARES ====================
 
@@ -158,7 +176,7 @@ def cmd_config(message):
 ⏰ Aviso previo: **{DIAS_AVISO} días**
 👥 Usuarios monitoreados: **{total_usuarios}**
 
-📝 El bot está monitoreando la actividad de todos los usuarios.
+🔍 El bot está monitoreando la actividad de todos los usuarios.
 Los usuarios inactivos recibirán un aviso {DIAS_AVISO} días antes de ser expulsados.
 
 Comandos útiles:
@@ -236,15 +254,12 @@ def revisar_inactivos():
         for user_id, data in list(usuarios.items()):
             dias_inactivo = (ahora - data['last_activity']) / 86400
             
-            # Expulsar si superó el límite
             if dias_inactivo >= DIAS_INACTIVIDAD:
                 try:
-                    # Verificar que el usuario no sea admin
                     if not es_admin(int(chat_id), int(user_id)):
                         bot.kick_chat_member(int(chat_id), int(user_id))
-                        bot.unban_chat_member(int(chat_id), int(user_id))  # Desbanear para que pueda volver
+                        bot.unban_chat_member(int(chat_id), int(user_id))
                         
-                        # Notificar en el grupo
                         username = data['username']
                         bot.send_message(
                             int(chat_id),
@@ -252,14 +267,12 @@ def revisar_inactivos():
                             parse_mode='Markdown'
                         )
                         
-                        # Eliminar del registro
                         del usuarios_data[chat_id][user_id]
                         guardar_datos()
                         print(f"✅ Usuario {user_id} expulsado del chat {chat_id}")
                 except Exception as e:
                     print(f"❌ Error expulsando usuario {user_id}: {e}")
             
-            # Enviar aviso si está en periodo de aviso
             elif dias_inactivo >= (DIAS_INACTIVIDAD - DIAS_AVISO) and not data.get('warned', False):
                 try:
                     username = data['username']
@@ -273,7 +286,6 @@ def revisar_inactivos():
                     
                     bot.send_message(int(chat_id), mensaje, parse_mode='Markdown')
                     
-                    # Marcar como advertido
                     usuarios_data[chat_id][user_id]['warned'] = True
                     guardar_datos()
                     print(f"⚠️ Aviso enviado a usuario {user_id} en chat {chat_id}")
@@ -290,10 +302,9 @@ def tarea_revision_periodica():
         except Exception as e:
             print(f"❌ Error en revisión periódica: {e}")
         
-        # Esperar 6 horas (21600 segundos)
         time.sleep(21600)
 
-# ==================== SERVIDOR FLASK (KEEP ALIVE) ====================
+# ==================== SERVIDOR FLASK ====================
 
 @app.route('/')
 def home():
@@ -305,23 +316,33 @@ def run_flask():
 # ==================== INICIO DEL BOT ====================
 
 if __name__ == '__main__':
+    # Registrar limpieza al salir
+    atexit.register(eliminar_lock)
+    signal.signal(signal.SIGTERM, cleanup)
+    signal.signal(signal.SIGINT, cleanup)
+    
+    # Crear lock para evitar múltiples instancias
+    crear_lock()
+    
     print("🚀 Iniciando bot de inactividad...")
     
-    # Cargar datos guardados
     cargar_datos()
     
-    # Iniciar servidor Flask en thread separado (para keep alive)
     flask_thread = Thread(target=run_flask)
     flask_thread.daemon = True
     flask_thread.start()
     print("✅ Servidor Flask iniciado")
     
-    # Iniciar tarea de revisión periódica
     revision_thread = Thread(target=tarea_revision_periodica)
     revision_thread.daemon = True
     revision_thread.start()
     print("✅ Tarea de revisión periódica iniciada")
     
-    # Iniciar bot
     print("✅ Bot iniciado y escuchando mensajes...")
-    bot.infinity_polling()
+    
+    try:
+        bot.infinity_polling(timeout=60, long_polling_timeout=60)
+    except Exception as e:
+        print(f"❌ Error en polling: {e}")
+        eliminar_lock()
+        sys.exit(1)
