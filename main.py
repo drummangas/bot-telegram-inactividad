@@ -189,7 +189,7 @@ def cmd_scan(message):
         if expulsados:
             txt += "• Expulsados: " + ", ".join(fmt_user(u, n) for u, n in expulsados) + "\n"
         if fallidos:
-            txt += "• Fallidos: " + ", ".join("{} ({})".format(fmt_user(u, n), e) for u, n, e in fallidos))
+            txt += "• Fallidos: " + ", ".join("{} ({})".format(fmt_user(u, n), e) for u, n, e in fallidos)
         bot.reply_to(message, txt or "Sin resultados.")
 
 # Registrar actividad en grupos SIN atrapar comandos
@@ -221,3 +221,4 @@ def iniciar_tareas():
 setup_webhook()
 iniciar_tareas()
 # No polling aquí; Render + gunicorn sirven Flask.
+
