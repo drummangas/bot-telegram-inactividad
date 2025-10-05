@@ -278,7 +278,7 @@ def tarea_revision_periodica():
 def home():
     return "Bot activo"
 
-@app.route(f'/{BOT_TOKEN}', methods=['POST'])
+@app.route('/webhook', methods=['POST'])
 def webhook():
     try:
         if request.headers.get('content-type') == 'application/json':
@@ -305,7 +305,7 @@ if __name__ == '__main__':
     try:
         bot.remove_webhook()
         time.sleep(1)
-        webhook_url = f"{WEBHOOK_URL}/{BOT_TOKEN}"
+        webhook_url = f"{WEBHOOK_URL}/webhook"
         bot.set_webhook(url=webhook_url)
         print(f"Webhook configurado: {webhook_url}")
     except Exception as e:
@@ -321,4 +321,5 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
     print(f"Iniciando servidor en puerto {port}")
     app.run(host='0.0.0.0', port=port, debug=False)
+
 
