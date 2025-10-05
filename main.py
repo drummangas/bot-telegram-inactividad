@@ -1,28 +1,28 @@
 # main.py — Bot de inactividad (Flask + pyTelegramBotAPI)
-# Responde a /start, /config, /scan directamente en el webhook (sin decoradores).
-# Registra actividad en grupos y permite expulsar inactivos (SAFE_MODE controla si solo avisa).
+# Webhook directo + actividad persistente en JSON (carga/guarda automático).
 
 import os
 import time
+import json
 import logging
 from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Dict, Tuple, Any
 
 from flask import Flask, request
 import telebot
 
 # ====== LOGGING ======
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-telebot.logger.setLevel(logging.WARNING)  # puedes poner DEBUG si quieres más detalle
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+telebot.logger.setLevel(logging.WARNING)
 
 # ====== CONFIG ======
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 WEBHOOK_BASE = os.getenv("WEBHOOK_URL", "").rstrip("/")
-INACTIVITY_DAYS = int(os.getenv("INACTIVITY_DAYS", "14"))  # días para considerar inactivo
-SAFE_MODE = os.getenv("SAFE_MODE", "1") == "1"             # 1 = NO expulsa, solo avisa
+INACTIVITY_DAYS = int(os.getenv("INACTIVITY_DAYS", "14"))       # días para inactivo
+SAFE_MODE = os.getenv("SAFE_MODE", "1") == "1"                  # 1 = solo avisar, 0 = expulsar
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
+DATA_PATH = os.getenv("DATA_PATH", "data/activity.json").strip()
 
 if not BOT_TOKEN:
     raise RuntimeError("Falta BOT_TOKEN")
@@ -33,22 +33,96 @@ if not WEBHOOK_BASE:
 app = Flask(__name__)
 bot = telebot.TeleBot(BOT_TOKEN)  # sin parse_mode global
 
-# Memoria en RAM: {(chat_id, user_id): {"last_seen": datetime, "username": str}}
-activity = {}
+# ====== PERSISTENCIA ======
+# Estructura en memoria: {(chat_id, user_id): {"last_seen": datetime, "username": str}}
+activity: Dict[Tuple[int, int], Dict[str, Any]] = {}
+
+def _ensure_data_dir(path_str: str) -> Path:
+    p = Path(path_str)
+    if p.suffix:  # tiene nombre de archivo
+        p.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        p.mkdir(parents=True, exist_ok=True)
+        p = p / "activity.json"
+    return p
+
+DATA_FILE = _ensure_data_dir(DATA_PATH)
+
+def _dt_to_iso(dt: datetime) -> str:
+    return dt.replace(microsecond=0).isoformat() + "Z"
+
+def _iso_to_dt(s: str) -> datetime:
+    # Acepta '...Z' o sin 'Z'
+    try:
+        if s.endswith("Z"):
+            s = s[:-1]
+        return datetime.fromisoformat(s)
+    except Exception:
+        # fallback: ahora
+        return datetime.utcnow()
+
+def load_activity() -> None:
+    global activity
+    if not DATA_FILE.exists():
+        logging.info("[DATA] No hay archivo de actividad, se creará en: %s", DATA_FILE)
+        activity = {}
+        return
+    try:
+        with DATA_FILE.open("r", encoding="utf-8") as f:
+            raw = json.load(f)
+        # raw: {"<chat_id>|<user_id>": {"last_seen": iso, "username": str}, ...}
+        loaded = {}
+        for key, val in raw.items():
+            try:
+                chat_s, user_s = key.split("|", 1)
+                chat_id = int(chat_s)
+                user_id = int(user_s)
+                last_seen_iso = val.get("last_seen")
+                username = val.get("username", "") or ""
+                if last_seen_iso:
+                    dt = _iso_to_dt(last_seen_iso)
+                else:
+                    dt = datetime.utcnow()
+                loaded[(chat_id, user_id)] = {"last_seen": dt, "username": username}
+            except Exception:
+                continue
+        activity = loaded
+        logging.info("[DATA] Actividad cargada: %s registros", len(activity))
+    except Exception as e:
+        logging.exception("[DATA] Error cargando actividad: %s", e)
+        activity = {}
+
+def save_activity() -> None:
+    # Guardado atómico: escribimos a .tmp y renombramos
+    try:
+        serializable = {}
+        for (chat_id, user_id), data in activity.items():
+            dt = data.get("last_seen")
+            username = data.get("username", "") or ""
+            if isinstance(dt, datetime):
+                iso = _dt_to_iso(dt)
+            else:
+                iso = _dt_to_iso(datetime.utcnow())
+            serializable[f"{chat_id}|{user_id}"] = {"last_seen": iso, "username": username}
+
+        tmp = DATA_FILE.with_suffix(".json.tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(serializable, f, ensure_ascii=False, indent=2)
+        tmp.replace(DATA_FILE)
+        logging.info("[DATA] Actividad guardada (%s registros) en %s", len(serializable), DATA_FILE)
+    except Exception as e:
+        logging.exception("[DATA] Error guardando actividad: %s", e)
 
 # ====== UTIL ======
 def fmt_user(user_id, username):
     return "@{}".format(username) if username else "ID:{}".format(user_id)
 
 def actualizar_actividad(chat_id, user_id, username):
-    activity[(chat_id, user_id)] = {
-        "last_seen": datetime.utcnow(),
-        "username": username or ""
-    }
+    activity[(chat_id, user_id)] = {"last_seen": datetime.utcnow(), "username": username or ""}
     logging.info("[ACT] chat:%s user:%s @%s", chat_id, user_id, username or "")
+    save_activity()  # guardamos en cada actualización para no perder datos en reinicios
 
 def es_admin_usuario(user_id):
-    # Si no configuras ADMIN_IDS, cualquiera puede usar /scan
     return (user_id in ADMIN_IDS) if ADMIN_IDS else True
 
 def puede_expulsar(chat_id):
@@ -76,10 +150,8 @@ def es_grupo(chat_type):
     return chat_type in ("group", "supergroup")
 
 def es_mensaje_de_actividad(msg):
-    """Considera actividad si hay media o texto que NO empiece por '/'."""
     if "text" in msg and isinstance(msg["text"], str) and msg["text"].startswith("/"):
         return False
-    # Si hay cualquiera de estos contenidos, cuenta como actividad
     for k in ("text", "photo", "video", "audio", "document", "sticker", "voice", "animation", "video_note"):
         if k in msg:
             return True
@@ -106,13 +178,12 @@ def webhook():
             # Si quieres contar mensajes editados como actividad, descomenta:
             # handle_message(data["edited_message"], edited=True)
             pass
-        # Ignoramos otros tipos (callback_query, my_chat_member, etc.) en esta versión mínima
     except Exception as e:
         logging.exception("Error manejando update: %s", e)
 
     return "", 200
 
-# ====== LÓGICA PRINCIPAL (SIN DECORADORES) ======
+# ====== LÓGICA PRINCIPAL ======
 def handle_message(msg, edited=False):
     chat = msg.get("chat", {}) or {}
     chat_id = chat.get("id")
@@ -124,11 +195,11 @@ def handle_message(msg, edited=False):
 
     text = msg.get("text") or ""
 
-    # 1) Registrar actividad en grupos (si corresponde)
+    # 1) Registrar actividad en grupos
     if es_grupo(chat_type) and es_mensaje_de_actividad(msg):
         actualizar_actividad(chat_id, user_id, username)
 
-    # 2) Comandos: /start, /config, /scan
+    # 2) Comandos
     if isinstance(text, str) and text.startswith("/"):
         cmd = text.split()[0].lower()
 
@@ -152,8 +223,6 @@ def handle_message(msg, edited=False):
                 return
             ejecutar_scan(chat_id)
             return
-
-    # 3) Si no es comando: nada más que registrar actividad (ya hecho arriba)
 
 def responder_start(chat_id, chat_type):
     if chat_type == "private":
@@ -211,6 +280,9 @@ def ejecutar_scan(chat_id):
             else:
                 fallidos.append((u_id, uname, err or "error"))
 
+    # Guarda tras el scan (por si cambiaste SAFE_MODE y has expulsado)
+    save_activity()
+
     if SAFE_MODE:
         bot.send_message(chat_id, "🧪 Modo seguro activo: solo listado (no expulsados).")
     else:
@@ -233,5 +305,6 @@ def setup_webhook():
         logging.exception("[WEBHOOK] Error configurando webhook: %s", e)
 
 # ====== ARRANQUE ======
+load_activity()
 setup_webhook()
-# Importante: NO iniciar polling: Render + gunicorn sirven Flask.
+# No polling aquí; Render + gunicorn sirven Flask.
