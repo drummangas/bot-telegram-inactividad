@@ -1,7 +1,6 @@
 # main.py — Bot de inactividad (Flask + pyTelegramBotAPI)
-# Webhook directo + actividad persistente en JSON
-# Añadido: /backup para descargar el JSON, /ping con botón "Estoy activo",
-# y manejo de updates de membresía (chat_member) para anotar altas/bajas.
+# Webhook directo + persistencia JSON + /backup + /ping (con aviso educado)
+# TODOS los comandos solo para administradores.
 
 import os
 import time
@@ -22,8 +21,8 @@ telebot.logger.setLevel(logging.WARNING)
 # ====== CONFIG ======
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 WEBHOOK_BASE = os.getenv("WEBHOOK_URL", "").rstrip("/")
-INACTIVITY_DAYS = int(os.getenv("INACTIVITY_DAYS", "14"))       # días para inactivo
-SAFE_MODE = os.getenv("SAFE_MODE", "1") == "1"                  # 1 = solo avisar, 0 = expulsar
+INACTIVITY_DAYS = int(os.getenv("INACTIVITY_DAYS", "14"))     # días para inactivo
+SAFE_MODE = os.getenv("SAFE_MODE", "1") == "1"                # 1 = solo avisar, 0 = expulsar
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 DATA_PATH = os.getenv("DATA_PATH", "data/activity.json").strip()
 
@@ -34,10 +33,10 @@ if not WEBHOOK_BASE:
 
 # ====== APP/BOT ======
 app = Flask(__name__)
-bot = telebot.TeleBot(BOT_TOKEN)  # sin parse_mode global
+bot = telebot.TeleBot(BOT_TOKEN)
 
-# ====== PERSISTENCIA ======
-# Estructura en memoria: {(chat_id, user_id): {"last_seen": datetime, "username": str}}
+# ====== PERSISTENCIA ACTIVIDAD ======
+# {(chat_id, user_id): {"last_seen": datetime, "username": str}}
 activity: Dict[Tuple[int, int], Dict[str, Any]] = {}
 
 def _ensure_data_dir(path_str: str) -> Path:
@@ -77,8 +76,8 @@ def load_activity() -> None:
                 chat_s, user_s = key.split("|", 1)
                 chat_id = int(chat_s)
                 user_id = int(user_s)
-                last_seen_iso = val.get("last_seen")
                 username = val.get("username", "") or ""
+                last_seen_iso = val.get("last_seen")
                 dt = _iso_to_dt(last_seen_iso) if last_seen_iso else datetime.utcnow()
                 loaded[(chat_id, user_id)] = {"last_seen": dt, "username": username}
             except Exception:
@@ -97,7 +96,6 @@ def save_activity() -> None:
             username = data.get("username", "") or ""
             iso = _dt_to_iso(dt) if isinstance(dt, datetime) else _dt_to_iso(datetime.utcnow())
             serializable[f"{chat_id}|{user_id}"] = {"last_seen": iso, "username": username}
-
         tmp = DATA_FILE.with_suffix(".json.tmp")
         with tmp.open("w", encoding="utf-8") as f:
             json.dump(serializable, f, ensure_ascii=False, indent=2)
@@ -115,10 +113,35 @@ def actualizar_actividad(chat_id, user_id, username):
     logging.info("[ACT] chat:%s user:%s @%s", chat_id, user_id, username or "")
     save_activity()
 
-def es_admin_usuario(user_id):
-    return (user_id in ADMIN_IDS) if ADMIN_IDS else True
+def es_grupo(chat_type: str) -> bool:
+    return chat_type in ("group", "supergroup")
 
-def puede_expulsar(chat_id):
+def es_mensaje_de_actividad(msg: Dict[str, Any]) -> bool:
+    if "text" in msg and isinstance(msg["text"], str) and msg["text"].startswith("/"):
+        return False
+    for k in ("text", "photo", "video", "audio", "document", "sticker", "voice", "animation", "video_note"):
+        if k in msg:
+            return True
+    return False
+
+# ---- PERMISOS (UNIFICADO) ----
+def es_admin_usuario(user_id: int) -> bool:
+    """Admin declarado por variable de entorno ADMIN_IDS."""
+    return user_id in ADMIN_IDS
+
+def es_admin_en_este_chat(chat_id: int, chat_type: str, user_id: int) -> bool:
+    """True si es admin/creator del grupo, o está en ADMIN_IDS (sirve también para privado)."""
+    if es_admin_usuario(user_id):
+        return True
+    if chat_type in ("group", "supergroup"):
+        try:
+            m = bot.get_chat_member(chat_id, user_id)
+            return getattr(m, "status", "") in ("administrator", "creator")
+        except Exception:
+            return False
+    return False
+
+def puede_expulsar(chat_id: int) -> bool:
     try:
         me = bot.get_me()
         member = bot.get_chat_member(chat_id, me.id)
@@ -131,24 +154,13 @@ def puede_expulsar(chat_id):
         logging.warning("puede_expulsar error: %s", e)
         return False
 
-def expulsar_usuario(chat_id, user_id):
+def expulsar_usuario(chat_id: int, user_id: int):
     try:
         bot.ban_chat_member(chat_id, user_id)
         bot.unban_chat_member(chat_id, user_id, only_if_banned=True)
         return True, None
     except Exception as e:
         return False, str(e)
-
-def es_grupo(chat_type):
-    return chat_type in ("group", "supergroup")
-
-def es_mensaje_de_actividad(msg):
-    if "text" in msg and isinstance(msg["text"], str) and msg["text"].startswith("/"):
-        return False
-    for k in ("text", "photo", "video", "audio", "document", "sticker", "voice", "animation", "video_note"):
-        if k in msg:
-            return True
-    return False
 
 # ====== HTTP ======
 @app.route("/", methods=["GET"])
@@ -180,7 +192,7 @@ def webhook():
     return "", 200
 
 # ====== LÓGICA PRINCIPAL ======
-def handle_message(msg, edited=False):
+def handle_message(msg: Dict[str, Any], edited: bool = False):
     chat = msg.get("chat", {}) or {}
     chat_id = chat.get("id")
     chat_type = chat.get("type", "private")
@@ -195,9 +207,14 @@ def handle_message(msg, edited=False):
     if es_grupo(chat_type) and es_mensaje_de_actividad(msg):
         actualizar_actividad(chat_id, user_id, username)
 
-    # 2) Comandos
+    # 2) Comandos (TODOS requieren ser admin)
     if isinstance(text, str) and text.startswith("/"):
-        cmd = text.split()[0].lower()
+        cmd = text.split()[0].split("@")[0].lower()  # soporta /cmd@TuBot
+
+        # CORTAFUEGOS GLOBAL DE PERMISOS
+        if not es_admin_en_este_chat(chat_id, chat_type, user_id):
+            bot.send_message(chat_id, "⛔ Este comando es solo para administradores.")
+            return
 
         if cmd in ("/start", "/help"):
             responder_start(chat_id, chat_type)
@@ -211,9 +228,6 @@ def handle_message(msg, edited=False):
             if not es_grupo(chat_type):
                 bot.send_message(chat_id, "ℹ️ /scan se usa en grupos.")
                 return
-            if not es_admin_usuario(user_id):
-                bot.send_message(chat_id, "⛔ No tienes permiso para /scan.")
-                return
             if not puede_expulsar(chat_id):
                 bot.send_message(chat_id, "⚠️ No tengo permisos de administrador para expulsar aquí.")
                 return
@@ -221,9 +235,6 @@ def handle_message(msg, edited=False):
             return
 
         if cmd == "/backup":
-            if not es_admin_usuario(user_id):
-                bot.send_message(chat_id, "⛔ No tienes permiso para /backup.")
-                return
             try:
                 if chat_type != "private":
                     bot.send_message(chat_id, "📦 Te envío el archivo por privado.")
@@ -231,36 +242,35 @@ def handle_message(msg, edited=False):
                     with open(DATA_FILE, "rb") as f:
                         bot.send_document(user_id, f, caption=f"Backup de actividad ({DATA_FILE})")
                 else:
-                    bot.send_message(user_id, f"⚠️ No existe el archivo {DATA_FILE}. Escribe algo en el grupo y vuelve a probar.")
+                    bot.send_message(user_id, f"⚠️ No existe el archivo {DATA_FILE}. Escribe algo y vuelve a probar.")
             except Exception as e:
                 bot.send_message(chat_id, "⚠️ No pude enviarte el backup por privado. Abre chat conmigo (/start) y repite. Error: {}".format(e))
             return
 
         if cmd == "/ping":
-            # Publica un botón para registrar actividad sin escribir
             if not es_grupo(chat_type):
                 bot.send_message(chat_id, "ℹ️ /ping se usa en grupos.")
                 return
             enviar_ping(chat_id)
             return
 
-def responder_start(chat_id, chat_type):
+def responder_start(chat_id: int, chat_type: str):
     if chat_type == "private":
         bot.send_message(
             chat_id,
             "👋 ¡Hola! Funciono por webhook en Render.\n\n"
-            "Comandos:\n"
+            "Comandos (solo admins):\n"
             "• /config — ver configuración\n"
-            "• /scan — revisar inactividad ahora (si tienes permiso)\n"
-            "• /backup — descargar el activity.json (solo admins)\n"
-            "• /ping — publicar botón “Estoy activo” para registrar sin escribir\n\n"
+            "• /scan — revisar inactividad ahora\n"
+            "• /backup — descargar activity.json\n"
+            "• /ping — publicar botón “Estoy activo”\n\n"
             "En grupos: añádeme y dame permisos de **banear**.",
             parse_mode="Markdown"
         )
     else:
-        bot.send_message(chat_id, "✅ Bot operativo. Usa /config, /scan, /backup (admins) y /ping.")
+        bot.send_message(chat_id, "✅ Bot operativo (comandos solo para administradores).")
 
-def responder_config(chat_id):
+def responder_config(chat_id: int):
     txt = (
         "⚙️ Configuración\n"
         "• Días de inactividad: {}\n"
@@ -271,7 +281,7 @@ def responder_config(chat_id):
     ).format(INACTIVITY_DAYS, "Sí" if SAFE_MODE else "No")
     bot.send_message(chat_id, txt)
 
-def ejecutar_scan(chat_id):
+def ejecutar_scan(chat_id: int):
     umbral = datetime.utcnow() - timedelta(days=INACTIVITY_DAYS)
     inactivos = []
     for (c_id, u_id), data in activity.items():
@@ -285,8 +295,7 @@ def ejecutar_scan(chat_id):
         bot.send_message(chat_id, "✅ No hay inactivos según el registro actual.")
         return
 
-    expulsados = []
-    fallidos = []
+    expulsados, fallidos = [], []
     for u_id, uname, last_seen in inactivos:
         if SAFE_MODE:
             bot.send_message(
@@ -314,18 +323,20 @@ def ejecutar_scan(chat_id):
             partes.append("• Fallidos: " + ", ".join("{} ({})".format(fmt_user(u, n), e) for u, n, e in fallidos))
         bot.send_message(chat_id, "\n".join(partes))
 
-# ====== /ping: botón para registrar actividad sin escribir ======
-def enviar_ping(chat_id):
+# ====== /ping: botón + aviso educado ======
+def enviar_ping(chat_id: int):
     text = (
         "🔎 *Pase de lista*\n"
         "Si sigues activo en el grupo, pulsa el botón para registrar tu actividad "
-        "sin necesidad de escribir."
+        "sin necesidad de escribir.\n\n"
+        "ℹ️ *Aviso*: quienes no pulsen el botón en los próximos *28 días* "
+        "podrán ser *baneados* por inactividad. Lo hacemos con cariño, solo para mantener "
+        "el grupo ordenado. ¡Gracias por tu comprensión! 🙏"
     )
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("Estoy activo ✅", callback_data="ping:active"))
     try:
         msg = bot.send_message(chat_id, text, reply_markup=markup, parse_mode="Markdown")
-        # Si el bot es admin, intenta fijar el mensaje
         try:
             bot.pin_chat_message(chat_id, msg.message_id, disable_notification=True)
         except Exception:
@@ -333,7 +344,7 @@ def enviar_ping(chat_id):
     except Exception as e:
         logging.warning("enviar_ping error: %s", e)
 
-def handle_callback(cb):
+def handle_callback(cb: Dict[str, Any]):
     try:
         data = cb.get("data", "")
         user = cb.get("from", {}) or {}
@@ -345,17 +356,11 @@ def handle_callback(cb):
 
         if data == "ping:active" and chat_id and user_id:
             actualizar_actividad(chat_id, user_id, username)
-            # confirma al usuario
             bot.answer_callback_query(cb.get("id"), text="¡Anotado! ✅")
     except Exception as e:
         logging.warning("handle_callback error: %s", e)
 
-# ====== Eventos de membresía (altas/bajas) ======
-def handle_chat_member_update(cm):
-    """
-    Anota 'member' como activo al entrar/ser añadido.
-    Elimina del registro si sale/kicked.
-    """
+def handle_chat_member_update(cm: Dict[str, Any]):
     try:
         chat = cm.get("chat", {}) or {}
         chat_id = chat.get("id")
@@ -383,7 +388,6 @@ def setup_webhook():
         bot.remove_webhook()
         time.sleep(1)
         url = f"{WEBHOOK_BASE}/webhook"
-        # IMPORTANTe: añadimos callback_query y chat_member
         bot.set_webhook(
             url=url,
             allowed_updates=["message", "edited_message", "callback_query", "chat_member"]
@@ -393,6 +397,9 @@ def setup_webhook():
         logging.exception("[WEBHOOK] Error configurando webhook: %s", e)
 
 # ====== ARRANQUE ======
-load_activity()
-setup_webhook()
+def main():
+    load_activity()
+    setup_webhook()
+
+main()
 # No polling aquí; Render + gunicorn sirven Flask.
