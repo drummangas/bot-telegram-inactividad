@@ -1,5 +1,5 @@
 # main.py — Bot de inactividad (Flask + pyTelegramBotAPI)
-# Webhook directo + actividad persistente en JSON (carga/guarda automático).
+# Webhook directo + actividad persistente en JSON + comando /backup.
 
 import os
 import time
@@ -52,13 +52,11 @@ def _dt_to_iso(dt: datetime) -> str:
     return dt.replace(microsecond=0).isoformat() + "Z"
 
 def _iso_to_dt(s: str) -> datetime:
-    # Acepta '...Z' o sin 'Z'
     try:
         if s.endswith("Z"):
             s = s[:-1]
         return datetime.fromisoformat(s)
     except Exception:
-        # fallback: ahora
         return datetime.utcnow()
 
 def load_activity() -> None:
@@ -70,8 +68,7 @@ def load_activity() -> None:
     try:
         with DATA_FILE.open("r", encoding="utf-8") as f:
             raw = json.load(f)
-        # raw: {"<chat_id>|<user_id>": {"last_seen": iso, "username": str}, ...}
-        loaded = {}
+        loaded: Dict[Tuple[int, int], Dict[str, Any]] = {}
         for key, val in raw.items():
             try:
                 chat_s, user_s = key.split("|", 1)
@@ -79,10 +76,7 @@ def load_activity() -> None:
                 user_id = int(user_s)
                 last_seen_iso = val.get("last_seen")
                 username = val.get("username", "") or ""
-                if last_seen_iso:
-                    dt = _iso_to_dt(last_seen_iso)
-                else:
-                    dt = datetime.utcnow()
+                dt = _iso_to_dt(last_seen_iso) if last_seen_iso else datetime.utcnow()
                 loaded[(chat_id, user_id)] = {"last_seen": dt, "username": username}
             except Exception:
                 continue
@@ -93,16 +87,12 @@ def load_activity() -> None:
         activity = {}
 
 def save_activity() -> None:
-    # Guardado atómico: escribimos a .tmp y renombramos
     try:
-        serializable = {}
+        serializable: Dict[str, Dict[str, str]] = {}
         for (chat_id, user_id), data in activity.items():
             dt = data.get("last_seen")
             username = data.get("username", "") or ""
-            if isinstance(dt, datetime):
-                iso = _dt_to_iso(dt)
-            else:
-                iso = _dt_to_iso(datetime.utcnow())
+            iso = _dt_to_iso(dt) if isinstance(dt, datetime) else _dt_to_iso(datetime.utcnow())
             serializable[f"{chat_id}|{user_id}"] = {"last_seen": iso, "username": username}
 
         tmp = DATA_FILE.with_suffix(".json.tmp")
@@ -120,7 +110,7 @@ def fmt_user(user_id, username):
 def actualizar_actividad(chat_id, user_id, username):
     activity[(chat_id, user_id)] = {"last_seen": datetime.utcnow(), "username": username or ""}
     logging.info("[ACT] chat:%s user:%s @%s", chat_id, user_id, username or "")
-    save_activity()  # guardamos en cada actualización para no perder datos en reinicios
+    save_activity()
 
 def es_admin_usuario(user_id):
     return (user_id in ADMIN_IDS) if ADMIN_IDS else True
@@ -175,7 +165,7 @@ def webhook():
         if "message" in data:
             handle_message(data["message"])
         elif "edited_message" in data:
-            # Si quieres contar mensajes editados como actividad, descomenta:
+            # Si quieres contar mensajes editados como actividad:
             # handle_message(data["edited_message"], edited=True)
             pass
     except Exception as e:
@@ -224,6 +214,32 @@ def handle_message(msg, edited=False):
             ejecutar_scan(chat_id)
             return
 
+        if cmd == "/backup":
+            # solo admins; enviamos el archivo por privado
+            if not es_admin_usuario(user_id):
+                bot.send_message(chat_id, "⛔ No tienes permiso para /backup.")
+                return
+            try:
+                # avisa en grupo y envía por privado
+                if chat_type != "private":
+                    bot.send_message(chat_id, "📦 Te envío el archivo por privado.")
+                if DATA_FILE.exists():
+                    with open(DATA_FILE, "rb") as f:
+                        bot.send_document(
+                            user_id,
+                            f,
+                            caption=f"Backup de actividad ({DATA_FILE})"
+                        )
+                else:
+                    bot.send_message(user_id, f"⚠️ No existe el archivo {DATA_FILE}. Escribe algo en el grupo y vuelve a probar.")
+            except Exception as e:
+                bot.send_message(
+                    chat_id,
+                    "⚠️ No pude enviarte el backup por privado. "
+                    "Abre chat conmigo y envía /start, luego vuelve a probar.\nError: {}".format(e)
+                )
+            return
+
 def responder_start(chat_id, chat_type):
     if chat_type == "private":
         bot.send_message(
@@ -231,12 +247,13 @@ def responder_start(chat_id, chat_type):
             "👋 ¡Hola! Funciono por webhook en Render.\n\n"
             "Comandos:\n"
             "• /config — ver configuración\n"
-            "• /scan — revisar inactividad ahora (si tienes permiso)\n\n"
+            "• /scan — revisar inactividad ahora (si tienes permiso)\n"
+            "• /backup — descargar el activity.json (solo admins)\n\n"
             "En grupos: añádeme y dame permisos de **banear**.",
             parse_mode="Markdown"
         )
     else:
-        bot.send_message(chat_id, "✅ Bot operativo. Usa /config y /scan.")
+        bot.send_message(chat_id, "✅ Bot operativo. Usa /config, /scan y /backup (admins).")
 
 def responder_config(chat_id):
     txt = (
@@ -280,8 +297,7 @@ def ejecutar_scan(chat_id):
             else:
                 fallidos.append((u_id, uname, err or "error"))
 
-    # Guarda tras el scan (por si cambiaste SAFE_MODE y has expulsado)
-    save_activity()
+    save_activity()  # por si hubo expulsiones
 
     if SAFE_MODE:
         bot.send_message(chat_id, "🧪 Modo seguro activo: solo listado (no expulsados).")
