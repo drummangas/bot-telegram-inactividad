@@ -88,14 +88,16 @@ def formatear_mencion(user_id, username):
 
 # ==================== MONITOREO DE ACTIVIDAD ====================
 
-@bot.message_handler(func=lambda message: True, content_types=['text', 'photo', 'video', 'audio', 'document', 'sticker', 'voice'])
+@bot.message_handler(
+    func=lambda m: m.chat.type in ['group', 'supergroup'] and not (getattr(m, 'text', '') or '').startswith('/'),
+    content_types=['text', 'photo', 'video', 'audio', 'document', 'sticker', 'voice']
+)
 def registrar_actividad(message):
-    if message.chat.type in ['group', 'supergroup']:
-        actualizar_actividad(
-            message.chat.id,
-            message.from_user.id,
-            message.from_user.username
-        )
+    actualizar_actividad(
+        message.chat.id,
+        message.from_user.id,
+        message.from_user.username
+    )
 
 # ==================== COMANDOS ====================
 
@@ -280,24 +282,13 @@ def home():
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    print("=== WEBHOOK RECIBIDO ===")
-    try:
-        print(f"Content-Type: {request.headers.get('content-type')}")
-        print(f"Método: {request.method}")
-        
-        if request.headers.get('content-type') == 'application/json':
-            json_string = request.get_data().decode('utf-8')
-            print(f"JSON recibido: {json_string}")
-            
-            update = telebot.types.Update.de_json(json_string)
-            print(f"Update parseado: {update.update_id}")
-            
-            bot.process_new_updates([update])
-            print("Update procesado correctamente")
-            return '', 200
-        else:
-            print("Content-type incorrecto")
-            return '', 403
+    if request.is_json:  # acepta también application/json con charset
+        json_string = request.get_data(as_text=True)
+        update = telebot.types.Update.de_json(json_string)
+        bot.process_new_updates([update])
+        return '', 200
+    return '', 403
+
     except Exception as e:
         print(f"ERROR en webhook: {e}")
         import traceback
@@ -331,6 +322,7 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
     print(f"Iniciando servidor en puerto {port}")
     app.run(host='0.0.0.0', port=port, debug=False)
+
 
 
 
