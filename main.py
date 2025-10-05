@@ -304,11 +304,17 @@ if __name__ == '__main__':
     
     # Configurar webhook
     try:
-        bot.remove_webhook()
-        time.sleep(1)
+    bot.remove_webhook()
+    time.sleep(1)
+    if WEBHOOK_URL:
         webhook_url = f"{WEBHOOK_URL}/webhook"
-        bot.set_webhook(url=webhook_url)
+        bot.set_webhook(url=webhook_url, allowed_updates=["message"])
         print(f"Webhook configurado: {webhook_url}")
+    else:
+        print("WEBHOOK_URL no configurado en variables de entorno")
+except Exception as e:
+    print(f"Error configurando webhook: {e}")
+
     except Exception as e:
         print(f"Error configurando webhook: {e}")
     
@@ -322,6 +328,7 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
     print(f"Iniciando servidor en puerto {port}")
     app.run(host='0.0.0.0', port=port, debug=False)
+
 
 
 
