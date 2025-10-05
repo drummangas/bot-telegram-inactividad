@@ -1,335 +1,264 @@
+# main.py
 import os
-import json
-from datetime import datetime
-from threading import Thread
 import time
-import telebot
+import threading
+from datetime import datetime, timedelta
+
 from flask import Flask, request
+import telebot
+from telebot import types
 
-# ==================== CONFIGURACIÓN ====================
+# ==================== CONFIG ====================
 
-BOT_TOKEN = os.environ.get('BOT_TOKEN')
-WEBHOOK_URL = os.environ.get('WEBHOOK_URL')
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+WEBHOOK_BASE = os.getenv("WEBHOOK_URL", "").rstrip("/")  # p.ej. https://bot-telegram-inactividad.onrender.com
+INACTIVITY_DAYS = int(os.getenv("INACTIVITY_DAYS", "14"))  # días sin actividad para considerar inactivo
+SAFE_MODE = os.getenv("SAFE_MODE", "1") == "1"  # en modo seguro NO expulsa, solo avisa
+ADMIN_IDS = {
+    int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()
+}
 
-DIAS_INACTIVIDAD = 28
-DIAS_AVISO = 3
+if not BOT_TOKEN:
+    raise RuntimeError("Falta BOT_TOKEN en variables de entorno")
 
-MENSAJE_AVISO = """
-👋 Hola {mention},
+# ==================== APP / BOT ====================
 
-Llevas **{dias} días sin participar** en nuestro grupo de batería.
-
-🥁 Un simple 👍, un "gracias" o cualquier mensaje bastan para seguir con nosotros.
-
-⏰ Tienes {dias_restantes} días para interactuar, o serás eliminado automáticamente.
-
-¡Esperamos leerte pronto!
-"""
-
-DATA_FILE = 'usuarios_actividad.json'
-
-# ==================== INICIALIZACIÓN ====================
-
-bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
 app = Flask(__name__)
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)  # parse_mode lo pondremos por mensaje si hace falta
 
-usuarios_data = {}
+# Memoria simple en RAM (se borra al reiniciar). Para persistencia real usar DB.
+# activity[(chat_id, user_id)] = {"last_seen": datetime, "username": str}
+activity = {}
 
-# ==================== FUNCIONES AUXILIARES ====================
+# ==================== UTILIDADES ====================
 
-def cargar_datos():
-    global usuarios_data
-    try:
-        if os.path.exists(DATA_FILE):
-            with open(DATA_FILE, 'r', encoding='utf-8') as f:
-                usuarios_data = json.load(f)
-                print(f"Datos cargados: {len(usuarios_data)} grupos")
-        else:
-            usuarios_data = {}
-            print("Archivo de datos creado")
-    except Exception as e:
-        print(f"Error cargando datos: {e}")
-        usuarios_data = {}
-
-def guardar_datos():
-    try:
-        with open(DATA_FILE, 'w', encoding='utf-8') as f:
-            json.dump(usuarios_data, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        print(f"Error guardando datos: {e}")
-
-def actualizar_actividad(chat_id, user_id, username):
-    chat_id = str(chat_id)
-    user_id = str(user_id)
-    
-    if chat_id not in usuarios_data:
-        usuarios_data[chat_id] = {}
-    
-    usuarios_data[chat_id][user_id] = {
-        'username': username or 'Usuario',
-        'last_activity': time.time(),
-        'warned': False
-    }
-    guardar_datos()
-
-def es_admin(chat_id, user_id):
-    try:
-        member = bot.get_chat_member(chat_id, user_id)
-        return member.status in ['creator', 'administrator']
-    except Exception as e:
-        print(f"Error verificando admin: {e}")
-        return False
-
-def formatear_mencion(user_id, username):
+def fmt_user_link(user_id: int, username: str | None) -> str:
+    """
+    Devuelve una mención clicable si hay username; si no, muestra el id.
+    Nota: Para tg://user hace falta Markdown; usaremos texto simple por simplicidad.
+    """
     if username:
         return f"@{username}"
-    else:
-        return f"[Usuario](tg://user?id={user_id})"
+    return f"ID:{user_id}"
 
-# ==================== MONITOREO DE ACTIVIDAD ====================
+def actualizar_actividad(chat_id: int, user_id: int, username: str | None):
+    key = (chat_id, user_id)
+    activity[key] = {
+        "last_seen": datetime.utcnow(),
+        "username": username or ""
+    }
+
+def dias_desde(dt: datetime) -> int:
+    return (datetime.utcnow() - dt).days
+
+def es_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS if ADMIN_IDS else True  # si no se define ADMIN_IDS, cualquiera puede usar /scan
+
+def puede_expulsar(chat_id: int) -> bool:
+    """
+    Comprueba si el bot es admin con permiso para banear en ese chat.
+    """
+    try:
+        me = bot.get_me()
+        member = bot.get_chat_member(chat_id, me.id)
+        status = getattr(member, "status", "")
+        can_restrict = getattr(member, "can_restrict_members", False)
+        # En supergrupos recientes, 'can_restrict_members' puede venir en ChatMemberAdministrator
+        return status in ("administrator", "creator") and (can_restrict or status == "creator")
+    except Exception:
+        return False
+
+def expulsar_usuario(chat_id: int, user_id: int):
+    """
+    Expulsa (ban + unban para permitir volver con enlace) a un usuario.
+    """
+    try:
+        bot.ban_chat_member(chat_id, user_id)
+        # desbanear para dejar la puerta abierta a volver con enlace de invitación
+        bot.unban_chat_member(chat_id, user_id, only_if_banned=True)
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+# ==================== ENDPOINTS WEB ====================
+
+@app.route("/", methods=["GET"])
+def health():
+    return "Bot activo ✅", 200
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    # Acepta application/json y application/json; charset=utf-8
+    if request.is_json:
+        json_string = request.get_data(as_text=True)
+        update = telebot.types.Update.de_json(json_string)
+        bot.process_new_updates([update])
+        return "", 200
+    return "", 403
+
+# ==================== CONFIGURACIÓN DEL WEBHOOK ====================
+
+def setup_webhook():
+    try:
+        bot.remove_webhook()
+        time.sleep(1)
+        if WEBHOOK_BASE:
+            webhook_url = f"{WEBHOOK_BASE}/webhook"
+            # Solo queremos updates de mensajes para este bot
+            bot.set_webhook(url=webhook_url, allowed_updates=["message"])
+            print(f"[WEBHOOK] Configurado: {webhook_url}")
+        else:
+            print("[WEBHOOK] WEBHOOK_URL no está configurado")
+    except Exception as e:
+        print(f"[WEBHOOK] Error configurando webhook: {e}")
+
+# ==================== HANDLERS ====================
+
+@bot.message_handler(commands=["start", "help"])
+def cmd_start_help(message: types.Message):
+    try:
+        chat_type = getattr(message.chat, "type", "private")
+        if chat_type == "private":
+            bot.reply_to(
+                message,
+                "👋 ¡Hola! Estoy vivo.\n\n"
+                "Puedo ayudar a detectar y expulsar usuarios inactivos en tus grupos.\n"
+                "1) Añádeme al grupo\n"
+                "2) Dame permisos de administrador (banear)\n"
+                "3) Usa /config en el grupo para ver opciones\n\n"
+                "Comandos:\n"
+                "• /config – ver configuración\n"
+                "• /scan – comprueba ahora la inactividad (si eres admin del bot)\n"
+            )
+        else:
+            bot.reply_to(
+                message,
+                "✅ Bot operativo. Usa /config para ver la configuración y /scan para revisar inactividad."
+            )
+    except Exception:
+        pass
+
+@bot.message_handler(commands=["config"])
+def cmd_config(message: types.Message):
+    try:
+        chat_id = message.chat.id
+        texto = (
+            "⚙️ Configuración actual\n"
+            f"• Días de inactividad: {INACTIVITY_DAYS}\n"
+            f"• Modo seguro (no expulsa): {'Sí' if SAFE_MODE else 'No'}\n"
+            "• Requisitos:\n"
+            "  - El bot debe ser administrador con permiso para banear.\n"
+            "  - La privacidad del bot afecta lo que puede leer en grupos.\n\n"
+            "Comandos:\n"
+            "• /scan – revisa ahora quién está inactivo\n"
+        )
+        bot.reply_to(message, texto)
+    except Exception:
+        pass
+
+@bot.message_handler(commands=["scan"])
+def cmd_scan(message: types.Message):
+    try:
+        user_id = message.from_user.id
+        if not es_admin(user_id):
+            bot.reply_to(message, "⛔ No tienes permiso para ejecutar /scan.")
+            return
+
+        chat = message.chat
+        if chat.type not in ("group", "supergroup"):
+            bot.reply_to(message, "ℹ️ /scan se usa en grupos.")
+            return
+
+        chat_id = chat.id
+        if not puede_expulsar(chat_id):
+            bot.reply_to(message, "⚠️ No tengo permisos de administrador para expulsar en este grupo.")
+            return
+
+        # Revisión sencilla: mira la tabla 'activity' y busca inactivos por chat
+        umbral = datetime.utcnow() - timedelta(days=INACTIVITY_DAYS)
+        inactivos = []
+        for (c_id, u_id), data in activity.items():
+            if c_id != chat_id:
+                continue
+            last_seen = data.get("last_seen")
+            if last_seen and last_seen < umbral:
+                inactivos.append((u_id, data.get("username", ""), last_seen))
+
+        if not inactivos:
+            bot.reply_to(message, "✅ No hay usuarios inactivos según el registro actual.")
+            return
+
+        # Procesar inactivos
+        expulsados, fallidos = [], []
+        for u_id, uname, last_seen in inactivos:
+            if SAFE_MODE:
+                # Solo avisar
+                bot.send_message(
+                    chat_id,
+                    f"🔔 Usuario inactivo: {fmt_user_link(u_id, uname)} "
+                    f"(última actividad hace {dias_desde(last_seen)} días)"
+                )
+            else:
+                ok, err = expulsar_usuario(chat_id, u_id)
+                if ok:
+                    expulsados.append((u_id, uname))
+                else:
+                    fallidos.append((u_id, uname, err or "error desconocido"))
+
+        # Resumen
+        if SAFE_MODE:
+            bot.reply_to(message, "🧪 Modo seguro activo: solo se han listado inactivos (no expulsados).")
+        else:
+            txt = "🗑️ Expulsiones completadas.\n"
+            if expulsados:
+                txt += "• Expulsados: " + ", ".join(fmt_user_link(u, n) for u, n in expulsados) + "\n"
+            if fallidos:
+                txt += "• Fallidos: " + ", ".join(f"{fmt_user_link(u, n)} ({e})" for u, n, e in fallidos)
+            bot.reply_to(message, txt or "Sin resultados.")
+    except Exception:
+        pass
+
+# ==================== MONITOREO DE ACTIVIDAD (no capta comandos) ====================
 
 @bot.message_handler(
     func=lambda m: m.chat.type in ['group', 'supergroup'] and not (getattr(m, 'text', '') or '').startswith('/'),
     content_types=['text', 'photo', 'video', 'audio', 'document', 'sticker', 'voice']
 )
-def registrar_actividad(message):
-    actualizar_actividad(
-        message.chat.id,
-        message.from_user.id,
-        message.from_user.username
-    )
-
-# ==================== COMANDOS ====================
-
-@bot.message_handler(commands=['start', 'help'])
-def cmd_start(message):
+def registrar_actividad(message: types.Message):
     try:
-        if message.chat.type == 'private':
-            bot.reply_to(message, 
-                "👋 Hola! Soy un bot que expulsa usuarios inactivos.\n\n"
-                "Comandos disponibles:\n"
-                "/start - Muestra este mensaje\n"
-                "/config - Ver configuración actual\n"
-                "/stats - Ver estadísticas del grupo\n"
-                "/check - Revisar usuarios inactivos ahora\n\n"
-                "Añádeme a tu grupo y hazme administrador con permisos de Banear usuarios"
-            )
-        else:
-            if es_admin(message.chat.id, message.from_user.id):
-                bot.reply_to(message,
-                    f"Bot activado en este grupo\n\n"
-                    f"Configuración:\n"
-                    f"Días de inactividad: {DIAS_INACTIVIDAD}\n"
-                    f"Aviso previo: {DIAS_AVISO} días\n"
-                    f"Usuarios registrados: {len(usuarios_data.get(str(message.chat.id), {}))}\n\n"
-                    f"Usa /config para más detalles"
-                )
-    except Exception as e:
-        print(f"Error en cmd_start: {e}")
+        actualizar_actividad(
+            message.chat.id,
+            message.from_user.id,
+            getattr(message.from_user, "username", None)
+        )
+        # Si quieres ver logs de actividad, descomenta:
+        # print(f"[ACTIVITY] chat:{message.chat.id} user:{message.from_user.id} {message.from_user.username} @ {datetime.utcnow()}")
+    except Exception:
+        pass
 
-@bot.message_handler(commands=['config'])
-def cmd_config(message):
-    try:
-        if message.chat.type not in ['group', 'supergroup']:
-            bot.reply_to(message, "Este comando solo funciona en grupos")
-            return
-        
-        if not es_admin(message.chat.id, message.from_user.id):
-            bot.reply_to(message, "Solo los administradores pueden usar este comando")
-            return
-        
-        chat_id = str(message.chat.id)
-        total_usuarios = len(usuarios_data.get(chat_id, {}))
-        
-        config_msg = f"""Configuración Actual
+# ==================== TAREA PERIÓDICA (opcional) ====================
 
-Días de inactividad: {DIAS_INACTIVIDAD} días
-Aviso previo: {DIAS_AVISO} días
-Usuarios monitoreados: {total_usuarios}
-
-El bot está monitoreando la actividad de todos los usuarios.
-Los usuarios inactivos recibirán un aviso {DIAS_AVISO} días antes de ser expulsados.
-
-Comandos útiles:
-/stats - Ver estadísticas detalladas
-/check - Revisar usuarios inactivos ahora
-"""
-        bot.reply_to(message, config_msg)
-    except Exception as e:
-        print(f"Error en cmd_config: {e}")
-
-@bot.message_handler(commands=['stats'])
-def cmd_stats(message):
-    try:
-        if message.chat.type not in ['group', 'supergroup']:
-            bot.reply_to(message, "Este comando solo funciona en grupos")
-            return
-        
-        if not es_admin(message.chat.id, message.from_user.id):
-            bot.reply_to(message, "Solo los administradores pueden usar este comando")
-            return
-        
-        chat_id = str(message.chat.id)
-        usuarios = usuarios_data.get(chat_id, {})
-        
-        if not usuarios:
-            bot.reply_to(message, "Aún no hay datos de actividad registrados.")
-            return
-        
-        ahora = time.time()
-        activos = 0
-        advertidos = 0
-        proximos_expulsar = 0
-        
-        for user_data in usuarios.values():
-            dias_inactivo = (ahora - user_data['last_activity']) / 86400
-            if dias_inactivo < DIAS_INACTIVIDAD - DIAS_AVISO:
-                activos += 1
-            elif dias_inactivo < DIAS_INACTIVIDAD:
-                advertidos += 1
-            else:
-                proximos_expulsar += 1
-        
-        stats_msg = f"""Estadísticas del Grupo
-
-Total usuarios: {len(usuarios)}
-Activos: {activos}
-Advertidos: {advertidos}
-Próximos a expulsar: {proximos_expulsar}
-
-Última actualización: {datetime.now().strftime('%d/%m/%Y %H:%M')}
-"""
-        bot.reply_to(message, stats_msg)
-    except Exception as e:
-        print(f"Error en cmd_stats: {e}")
-
-@bot.message_handler(commands=['check'])
-def cmd_check(message):
-    try:
-        if message.chat.type not in ['group', 'supergroup']:
-            bot.reply_to(message, "Este comando solo funciona en grupos")
-            return
-        
-        if not es_admin(message.chat.id, message.from_user.id):
-            bot.reply_to(message, "Solo los administradores pueden usar este comando")
-            return
-        
-        bot.reply_to(message, "Revisando usuarios inactivos...")
-        revisar_inactivos()
-        bot.send_message(message.chat.id, "Revisión completada")
-    except Exception as e:
-        print(f"Error en cmd_check: {e}")
-
-# ==================== REVISIÓN DE INACTIVIDAD ====================
-
-def revisar_inactivos():
-    ahora = time.time()
-    
-    for chat_id, usuarios in list(usuarios_data.items()):
-        for user_id, data in list(usuarios.items()):
-            try:
-                dias_inactivo = (ahora - data['last_activity']) / 86400
-                
-                if dias_inactivo >= DIAS_INACTIVIDAD:
-                    if not es_admin(int(chat_id), int(user_id)):
-                        bot.kick_chat_member(int(chat_id), int(user_id))
-                        bot.unban_chat_member(int(chat_id), int(user_id))
-                        
-                        username = data['username']
-                        bot.send_message(
-                            int(chat_id),
-                            f"Usuario {formatear_mencion(user_id, username)} ha sido expulsado por {DIAS_INACTIVIDAD} días de inactividad."
-                        )
-                        
-                        del usuarios_data[chat_id][user_id]
-                        guardar_datos()
-                        print(f"Usuario {user_id} expulsado del chat {chat_id}")
-                
-                elif dias_inactivo >= (DIAS_INACTIVIDAD - DIAS_AVISO) and not data.get('warned', False):
-                    username = data['username']
-                    dias_restantes = DIAS_INACTIVIDAD - int(dias_inactivo)
-                    
-                    mensaje = MENSAJE_AVISO.format(
-                        mention=formatear_mencion(user_id, username),
-                        dias=int(dias_inactivo),
-                        dias_restantes=dias_restantes
-                    )
-                    
-                    bot.send_message(int(chat_id), mensaje)
-                    
-                    usuarios_data[chat_id][user_id]['warned'] = True
-                    guardar_datos()
-                    print(f"Aviso enviado a usuario {user_id} en chat {chat_id}")
-            except Exception as e:
-                print(f"Error procesando usuario {user_id}: {e}")
-
-def tarea_revision_periodica():
+def tarea_periodica():
+    """
+    Hilo opcional para revisar inactividad cada X horas (aquí, 6 horas).
+    Si prefieres hacerlo a mano, usa /scan y no inicies este hilo.
+    """
     while True:
         try:
-            print(f"Iniciando revisión de inactividad - {datetime.now()}")
-            revisar_inactivos()
-            print("Revisión completada")
-        except Exception as e:
-            print(f"Error en revisión periódica: {e}")
-        
-        time.sleep(21600)
+            # No hace nada automáticamente para evitar expulsiones no deseadas.
+            # Puedes convertir esto en un aviso periódico si lo necesitas.
+            time.sleep(6 * 3600)
+        except Exception:
+            time.sleep(60)
 
-# ==================== WEBHOOK ====================
+def iniciar_tareas():
+    t = threading.Thread(target=tarea_periodica, daemon=True)
+    t.start()
 
-@app.route('/')
-def home():
-    return "Bot activo"
+# ==================== ARRANQUE ====================
 
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    if request.is_json:  # acepta también application/json con charset
-        json_string = request.get_data(as_text=True)
-        update = telebot.types.Update.de_json(json_string)
-        bot.process_new_updates([update])
-        return '', 200
-    return '', 403
+setup_webhook()
+iniciar_tareas()
 
-    except Exception as e:
-        print(f"ERROR en webhook: {e}")
-        import traceback
-        traceback.print_exc()
-        return '', 500
-
-# ==================== INICIO ====================
-
-if __name__ == '__main__':
-    print("Iniciando bot con webhooks...")
-    
-    cargar_datos()
-    
-    # Configurar webhook
-    try:
-    bot.remove_webhook()
-    time.sleep(1)
-    if WEBHOOK_URL:
-        webhook_url = f"{WEBHOOK_URL}/webhook"
-        bot.set_webhook(url=webhook_url, allowed_updates=["message"])
-        print(f"Webhook configurado: {webhook_url}")
-    else:
-        print("WEBHOOK_URL no configurado en variables de entorno")
-except Exception as e:
-    print(f"Error configurando webhook: {e}")
-
-    except Exception as e:
-        print(f"Error configurando webhook: {e}")
-    
-    # Iniciar tarea de revisión
-    revision_thread = Thread(target=tarea_revision_periodica)
-    revision_thread.daemon = True
-    revision_thread.start()
-    print("Tarea de revisión iniciada")
-    
-    # Iniciar servidor Flask
-    port = int(os.environ.get('PORT', 10000))
-    print(f"Iniciando servidor en puerto {port}")
-    app.run(host='0.0.0.0', port=port, debug=False)
-
-
-
-
-
+# Nota: En Render/Gunicorn se usa: gunicorn main:app --workers 1 --threads 4 --timeout 0
+# El servidor Flask lo gestiona Gunicorn; NO llames bot.infinity_polling() aquí porque usas webhook.
