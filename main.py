@@ -1,4 +1,4 @@
-# main.py — Render + Flask + pyTelegramBotAPI (con logs de diagnóstico)
+# main.py — Render + Flask + pyTelegramBotAPI (con logs de diagnóstico, corregido)
 
 import os
 import time
@@ -82,7 +82,7 @@ def webhook():
         return "", 403
 
     json_string = request.get_data(as_text=True)
-    logging.info("Webhook JSON recibido: %s", json_string[:500])  # truncamos por si es largo
+    logging.info("Webhook JSON recibido: %s", json_string[:500])  # truncado
 
     try:
         update = telebot.types.Update.de_json(json_string)
@@ -189,4 +189,35 @@ def cmd_scan(message):
         if expulsados:
             txt += "• Expulsados: " + ", ".join(fmt_user(u, n) for u, n in expulsados) + "\n"
         if fallidos:
-            txt += "• Fallidos
+            txt += "• Fallidos: " + ", ".join("{} ({})".format(fmt_user(u, n), e) for u, n, e in fallidos))
+        bot.reply_to(message, txt or "Sin resultados.")
+
+# Registrar actividad en grupos SIN atrapar comandos
+@bot.message_handler(
+    func=lambda m: m.chat.type in ('group', 'supergroup') and not ((getattr(m, 'text', '') or '').startswith('/')),
+    content_types=['text', 'photo', 'video', 'audio', 'document', 'sticker', 'voice']
+)
+def registrar_actividad(message):
+    try:
+        actualizar_actividad(
+            message.chat.id,
+            message.from_user.id,
+            getattr(message.from_user, "username", None)
+        )
+        logging.info("[ACT] chat:%s user:%s @%s", message.chat.id, message.from_user.id, getattr(message.from_user, "username", None))
+    except Exception as e:
+        logging.warning("registrar_actividad error: %s", e)
+
+# ====== TAREA PERIÓDICA (placeholder) ======
+def tarea_periodica():
+    while True:
+        time.sleep(6 * 3600)
+
+def iniciar_tareas():
+    t = threading.Thread(target=tarea_periodica, daemon=True)
+    t.start()
+
+# ====== ARRANQUE ======
+setup_webhook()
+iniciar_tareas()
+# No polling aquí; Render + gunicorn sirven Flask.
