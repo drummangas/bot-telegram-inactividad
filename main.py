@@ -280,18 +280,28 @@ def home():
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
+    print("=== WEBHOOK RECIBIDO ===")
     try:
+        print(f"Content-Type: {request.headers.get('content-type')}")
+        print(f"Método: {request.method}")
+        
         if request.headers.get('content-type') == 'application/json':
             json_string = request.get_data().decode('utf-8')
             print(f"JSON recibido: {json_string}")
+            
             update = telebot.types.Update.de_json(json_string)
+            print(f"Update parseado: {update.update_id}")
+            
             bot.process_new_updates([update])
-            print(f"Update procesado: {update.update_id}")
+            print("Update procesado correctamente")
             return '', 200
         else:
+            print("Content-type incorrecto")
             return '', 403
     except Exception as e:
-        print(f"Error en webhook: {e}")
+        print(f"ERROR en webhook: {e}")
+        import traceback
+        traceback.print_exc()
         return '', 500
 
 # ==================== INICIO ====================
@@ -321,5 +331,6 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
     print(f"Iniciando servidor en puerto {port}")
     app.run(host='0.0.0.0', port=port, debug=False)
+
 
 
