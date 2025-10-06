@@ -1,6 +1,7 @@
 # main.py — Bot de inactividad (Flask + pyTelegramBotAPI)
-# Webhook directo + persistencia JSON + /backup + /ping (con aviso educado)
+# Webhook directo + persistencia JSON + /backup + /ping (aviso educado)
 # TODOS los comandos solo para administradores.
+# Guarda username y nombre completo; /whois y /fixnames para identificar usuarios sin @.
 
 import os
 import time
@@ -36,7 +37,7 @@ app = Flask(__name__)
 bot = telebot.TeleBot(BOT_TOKEN)
 
 # ====== PERSISTENCIA ACTIVIDAD ======
-# {(chat_id, user_id): {"last_seen": datetime, "username": str}}
+# {(chat_id, user_id): {"last_seen": datetime, "username": str, "name": str}}
 activity: Dict[Tuple[int, int], Dict[str, Any]] = {}
 
 def _ensure_data_dir(path_str: str) -> Path:
@@ -74,12 +75,12 @@ def load_activity() -> None:
         for key, val in raw.items():
             try:
                 chat_s, user_s = key.split("|", 1)
-                chat_id = int(chat_s)
-                user_id = int(user_s)
+                chat_id = int(chat_s); user_id = int(user_s)
                 username = val.get("username", "") or ""
+                name = val.get("name", "") or ""
                 last_seen_iso = val.get("last_seen")
                 dt = _iso_to_dt(last_seen_iso) if last_seen_iso else datetime.utcnow()
-                loaded[(chat_id, user_id)] = {"last_seen": dt, "username": username}
+                loaded[(chat_id, user_id)] = {"last_seen": dt, "username": username, "name": name}
             except Exception:
                 continue
         activity = loaded
@@ -94,8 +95,9 @@ def save_activity() -> None:
         for (chat_id, user_id), data in activity.items():
             dt = data.get("last_seen")
             username = data.get("username", "") or ""
+            name = data.get("name", "") or ""
             iso = _dt_to_iso(dt) if isinstance(dt, datetime) else _dt_to_iso(datetime.utcnow())
-            serializable[f"{chat_id}|{user_id}"] = {"last_seen": iso, "username": username}
+            serializable[f"{chat_id}|{user_id}"] = {"last_seen": iso, "username": username, "name": name}
         tmp = DATA_FILE.with_suffix(".json.tmp")
         with tmp.open("w", encoding="utf-8") as f:
             json.dump(serializable, f, ensure_ascii=False, indent=2)
@@ -105,12 +107,17 @@ def save_activity() -> None:
         logging.exception("[DATA] Error guardando actividad: %s", e)
 
 # ====== UTIL ======
-def fmt_user(user_id, username):
-    return "@{}".format(username) if username else "ID:{}".format(user_id)
+def _full_name(first: str = "", last: str = "") -> str:
+    return " ".join(x for x in [first or "", last or ""] if x).strip()
 
-def actualizar_actividad(chat_id, user_id, username):
-    activity[(chat_id, user_id)] = {"last_seen": datetime.utcnow(), "username": username or ""}
-    logging.info("[ACT] chat:%s user:%s @%s", chat_id, user_id, username or "")
+def actualizar_actividad(chat_id, user_id, username, first_name="", last_name=""):
+    full = _full_name(first_name, last_name)
+    activity[(chat_id, user_id)] = {
+        "last_seen": datetime.utcnow(),
+        "username": username or "",
+        "name": full
+    }
+    logging.info("[ACT] chat:%s user:%s %s @%s", chat_id, user_id, full or "", username or "")
     save_activity()
 
 def es_grupo(chat_type: str) -> bool:
@@ -126,7 +133,6 @@ def es_mensaje_de_actividad(msg: Dict[str, Any]) -> bool:
 
 # ---- PERMISOS (UNIFICADO) ----
 def es_admin_usuario(user_id: int) -> bool:
-    """Admin declarado por variable de entorno ADMIN_IDS."""
     return user_id in ADMIN_IDS
 
 def es_admin_en_este_chat(chat_id: int, chat_type: str, user_id: int) -> bool:
@@ -161,6 +167,26 @@ def expulsar_usuario(chat_id: int, user_id: int):
         return True, None
     except Exception as e:
         return False, str(e)
+
+def resolve_display(chat_id: int, user_id: int, cached: Dict[str, Any] = None) -> str:
+    """Etiqueta visible: @username > Nombre Apellido > ID."""
+    if cached:
+        uname = (cached.get("username") or "").strip()
+        if uname:
+            return f"@{uname}"
+        nm = (cached.get("name") or "").strip()
+        if nm:
+            return nm
+    try:
+        m = bot.get_chat_member(chat_id, user_id)
+        u = m.user
+        if getattr(u, "username", None):
+            return f"@{u.username}"
+        full = _full_name(getattr(u, "first_name", ""), getattr(u, "last_name", ""))
+        return full or f"ID:{user_id}"
+    except Exception as e:
+        logging.warning("resolve_display error: %s", e)
+        return f"ID:{user_id}"
 
 # ====== HTTP ======
 @app.route("/", methods=["GET"])
@@ -200,12 +226,14 @@ def handle_message(msg: Dict[str, Any], edited: bool = False):
     from_user = msg.get("from", {}) or {}
     user_id = from_user.get("id")
     username = from_user.get("username") or ""
+    first_name = from_user.get("first_name") or ""
+    last_name = from_user.get("last_name") or ""
 
     text = msg.get("text") or ""
 
     # 1) Registrar actividad en grupos
     if es_grupo(chat_type) and es_mensaje_de_actividad(msg):
-        actualizar_actividad(chat_id, user_id, username)
+        actualizar_actividad(chat_id, user_id, username, first_name, last_name)
 
     # 2) Comandos (TODOS requieren ser admin)
     if isinstance(text, str) and text.startswith("/"):
@@ -242,7 +270,7 @@ def handle_message(msg: Dict[str, Any], edited: bool = False):
                     with open(DATA_FILE, "rb") as f:
                         bot.send_document(user_id, f, caption=f"Backup de actividad ({DATA_FILE})")
                 else:
-                    bot.send_message(user_id, f"⚠️ No existe el archivo {DATA_FILE}. Escribe algo y vuelve a probar.")
+                    bot.send_message(user_id, f"⚠️ No existe el archivo {DATA_FILE}. Escribe algo en el grupo y vuelve a probar.")
             except Exception as e:
                 bot.send_message(chat_id, "⚠️ No pude enviarte el backup por privado. Abre chat conmigo (/start) y repite. Error: {}".format(e))
             return
@@ -254,6 +282,58 @@ def handle_message(msg: Dict[str, Any], edited: bool = False):
             enviar_ping(chat_id)
             return
 
+        if cmd == "/whois":
+            # Uso: /whois 123456789  o responde a un mensaje con /whois
+            target_id = None
+            parts = text.split()
+            if len(parts) > 1 and parts[1].isdigit():
+                target_id = int(parts[1])
+            elif msg.get("reply_to_message") and msg["reply_to_message"].get("from"):
+                target_id = msg["reply_to_message"]["from"]["id"]
+
+            if not target_id:
+                bot.send_message(chat_id, "Uso: responde a un mensaje con /whois o pon el ID: /whois 123456789")
+                return
+
+            try:
+                m = bot.get_chat_member(chat_id, target_id)
+                u = m.user
+                info = [
+                    f"ID: {u.id}",
+                    f"Usuario: @{u.username}" if u.username else "Usuario: (sin @)",
+                    "Nombre: " + _full_name(u.first_name or "", u.last_name or ""),
+                    f"Status en el chat: {getattr(m, 'status', 'desconocido')}"
+                ]
+                bot.send_message(chat_id, "👤\n" + "\n".join(info))
+            except Exception as e:
+                bot.send_message(chat_id, f"⚠️ No pude obtener info: {e}")
+            return
+
+        if cmd == "/fixnames":
+            actualizados = 0
+            revisados = 0
+            for (c_id, u_id), data in list(activity.items()):
+                if c_id != chat_id:
+                    continue
+                revisados += 1
+                if data.get("username"):
+                    continue  # ya tiene @
+                if data.get("name"):
+                    continue  # ya tiene nombre
+                try:
+                    m = bot.get_chat_member(chat_id, u_id)
+                    u = m.user
+                    full = _full_name(u.first_name or "", u.last_name or "")
+                    if full:
+                        data["name"] = full
+                        activity[(c_id, u_id)] = data
+                        actualizados += 1
+                except Exception:
+                    pass
+            save_activity()
+            bot.send_message(chat_id, f"🔧 Nombres completados: {actualizados} (revisados {revisados}).")
+            return
+
 def responder_start(chat_id: int, chat_type: str):
     if chat_type == "private":
         bot.send_message(
@@ -263,7 +343,9 @@ def responder_start(chat_id: int, chat_type: str):
             "• /config — ver configuración\n"
             "• /scan — revisar inactividad ahora\n"
             "• /backup — descargar activity.json\n"
-            "• /ping — publicar botón “Estoy activo”\n\n"
+            "• /ping — publicar botón “Estoy activo”\n"
+            "• /whois — ver datos de un usuario\n"
+            "• /fixnames — completar nombres faltantes\n\n"
             "En grupos: añádeme y dame permisos de **banear**.",
             parse_mode="Markdown"
         )
@@ -289,27 +371,31 @@ def ejecutar_scan(chat_id: int):
             continue
         last_seen = data.get("last_seen")
         if isinstance(last_seen, datetime) and last_seen < umbral:
-            inactivos.append((u_id, data.get("username", ""), last_seen))
+            inactivos.append((u_id, data))
 
     if not inactivos:
         bot.send_message(chat_id, "✅ No hay inactivos según el registro actual.")
         return
 
     expulsados, fallidos = [], []
-    for u_id, uname, last_seen in inactivos:
+    for u_id, data in inactivos:
+        uname = data.get("username", "")
+        last_seen = data.get("last_seen")
+        display = resolve_display(chat_id, u_id, {"username": uname, "name": data.get("name", "")})
+
         if SAFE_MODE:
             bot.send_message(
                 chat_id,
                 "🔔 Usuario inactivo: {} (última actividad hace {} días)".format(
-                    fmt_user(u_id, uname), (datetime.utcnow() - last_seen).days
+                    display, (datetime.utcnow() - last_seen).days
                 )
             )
         else:
             ok, err = expulsar_usuario(chat_id, u_id)
             if ok:
-                expulsados.append((u_id, uname))
+                expulsados.append((u_id, display))
             else:
-                fallidos.append((u_id, uname, err or "error"))
+                fallidos.append((u_id, display, err or "error"))
 
     save_activity()
 
@@ -318,12 +404,12 @@ def ejecutar_scan(chat_id: int):
     else:
         partes = ["🗑️ Expulsiones:"]
         if expulsados:
-            partes.append("• Expulsados: " + ", ".join(fmt_user(u, n) for u, n in expulsados))
+            partes.append("• Expulsados: " + ", ".join(d for _, d in expulsados))
         if fallidos:
-            partes.append("• Fallidos: " + ", ".join("{} ({})".format(fmt_user(u, n), e) for u, n, e in fallidos))
+            partes.append("• Fallidos: " + ", ".join(f"{d} ({e})" for _, d, e in fallidos))
         bot.send_message(chat_id, "\n".join(partes))
 
-# ====== /ping: botón + aviso educado ======
+# ====== /ping: botón + aviso educado (28 días) ======
 def enviar_ping(chat_id: int):
     text = (
         "🔎 *Pase de lista*\n"
@@ -350,12 +436,14 @@ def handle_callback(cb: Dict[str, Any]):
         user = cb.get("from", {}) or {}
         user_id = user.get("id")
         username = user.get("username") or ""
+        first_name = user.get("first_name") or ""
+        last_name = user.get("last_name") or ""
         msg = cb.get("message", {}) or {}
         chat = msg.get("chat", {}) or {}
         chat_id = chat.get("id")
 
         if data == "ping:active" and chat_id and user_id:
-            actualizar_actividad(chat_id, user_id, username)
+            actualizar_actividad(chat_id, user_id, username, first_name, last_name)
             bot.answer_callback_query(cb.get("id"), text="¡Anotado! ✅")
     except Exception as e:
         logging.warning("handle_callback error: %s", e)
@@ -368,13 +456,15 @@ def handle_chat_member_update(cm: Dict[str, Any]):
         user = new.get("user", {}) or {}
         user_id = user.get("id")
         username = user.get("username") or ""
+        first_name = user.get("first_name") or ""
+        last_name = user.get("last_name") or ""
         new_status = new.get("status")
 
         if not chat_id or not user_id:
             return
 
         if new_status in ("member", "administrator", "creator"):
-            actualizar_actividad(chat_id, user_id, username)
+            actualizar_actividad(chat_id, user_id, username, first_name, last_name)
         elif new_status in ("left", "kicked"):
             if (chat_id, user_id) in activity:
                 del activity[(chat_id, user_id)]
